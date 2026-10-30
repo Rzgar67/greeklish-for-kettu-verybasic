@@ -1,0 +1,7 @@
+{
+  "name": "Greeklish Translator",
+  "description": "Long-press a message and pick 'Translate Greeklish' to convert it to Greek and translate it to English.",
+  "authors": [{ "name": "Rzg" }],
+  "main": "index.js",
+  "vendetta": { "icon": "ic_locale_24px" }
+}
