@@ -1,17 +1,16 @@
 (function () {
   const { before, after } = vendetta.patcher;
   const { findByProps, findByStoreName } = vendetta.metro;
-  const { React, ReactNative, stylesheet } = vendetta.metro.common;
+  const { React, ReactNative, stylesheet, FluxDispatcher } = vendetta.metro.common;
   const { findInReactTree } = vendetta.utils;
   const { getAssetIDByName } = vendetta.ui.assets;
   const { semanticColors } = vendetta.ui;
   const { Forms } = vendetta.ui.components;
-  const { showToast } = vendetta.ui.toasts;
-  const { showConfirmationAlert } = vendetta.ui.alerts;
 
   const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
   const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms.FormRow;
   const MessageStore = findByStoreName("MessageStore");
+  const ChannelStore = findByStoreName("ChannelStore");
 
   const styles = stylesheet.createThemedStyleSheet({
     iconComponent: {
@@ -20,6 +19,9 @@
       tintColor: semanticColors.INTERACTIVE_NORMAL,
     },
   });
+
+  // messageId -> original content (so we can revert)
+  let cache = {};
 
   // ---------- Greeklish -> Greek ----------
   const digraphs = [
@@ -49,7 +51,7 @@
   }
 
   async function translate(text) {
-    // keep mentions / emojis / channels untouched
+    // keep mentions / emojis / channels / links untouched
     const placeholders = [];
     const safe = text.replace(/<(a?):\w+:\d+>|<@[!&]?\d+>|<#\d+>|https?:\/\/\S+/g, (m) => {
       placeholders.push(m);
@@ -61,29 +63,44 @@
       encodeURIComponent(greek);
     const res = await fetch(url);
     const json = await res.json();
-    let english = json[0].map((s) => s[0]).join("");
+    const english = json[0].map((s) => s[0]).join("");
     const restore = (s) =>
       s.replace(/zzph(\d+)zz/gi, (_, n) => placeholders[Number(n)] ?? "");
-    return { greek: restore(greek), english: restore(english) };
+    return restore(english).trim();
   }
 
-  async function handle(content) {
-    if (!content?.trim()) return showToast("no text to translate", getAssetIDByName("Small"));
-    showToast("translating...", getAssetIDByName("LanguageIcon"));
+  function updateMessage(msg, content) {
+    FluxDispatcher.dispatch({
+      type: "MESSAGE_UPDATE",
+      message: {
+        id: msg.id,
+        channel_id: msg.channel_id,
+        guild_id: ChannelStore?.getChannel?.(msg.channel_id)?.guild_id,
+        content,
+      },
+      log_edit: false,
+      otherPluginBypass: true,
+    });
+  }
+
+  async function toggle(msg, content) {
     try {
-      const { greek, english } = await translate(content);
-      showConfirmationAlert({
-        title: "Greeklish Translation",
-        content: `🇬🇷 ${greek.trim()}\n\n🇬🇧 ${english.trim()}`,
-        confirmText: "Copy English",
-        cancelText: "Close",
-        onConfirm: () => {
-          try { ReactNative.Clipboard.setString(english.trim()); showToast("copied"); } catch (e) {}
-        },
-      });
+      // Revert
+      if (cache[msg.id] !== undefined) {
+        updateMessage(msg, cache[msg.id]);
+        delete cache[msg.id];
+        return;
+      }
+      // Translate
+      if (!content?.trim()) return;
+      const english = await translate(content);
+      cache[msg.id] = content;
+      updateMessage(msg, `${content}\n${english} \`[en]\``);
     } catch (e) {
       console.error("[Greeklish]", e);
-      showToast("translation failed :(", getAssetIDByName("Small"));
+      try {
+        ReactNative.Alert.alert("Greeklish Translator", "Translation failed. Check debug logs.");
+      } catch (_) {}
     }
   }
 
@@ -97,13 +114,19 @@
         React.useEffect(() => () => { unpatch(); }, []);
 
         const original = MessageStore?.getMessage?.(message.channel_id, message.id);
-        const content = original?.content ?? message.content;
+        const target = original ?? message;
+        const messageId = target.id ?? message.id;
+        const isTranslated = cache[messageId] !== undefined;
+        // when already translated, original text comes from the cache
+        const content = isTranslated ? cache[messageId] : (original?.content ?? message.content);
         if (!content) return;
 
-        const icon = getAssetIDByName("LanguageIcon") ?? getAssetIDByName("ic_locale_24px");
+        const icon = isTranslated
+          ? getAssetIDByName("ic_highlight")
+          : getAssetIDByName("LanguageIcon") ?? getAssetIDByName("ic_locale_24px");
 
         const row = React.createElement(ActionSheetRow, {
-          label: "Translate Greeklish",
+          label: isTranslated ? "Revert Greeklish" : "Translate Greeklish",
           icon: ActionSheetRow.Icon
             ? React.createElement(ActionSheetRow.Icon, {
                 source: icon,
@@ -117,7 +140,7 @@
             : undefined,
           onPress: () => {
             try { LazyActionSheet.hideActionSheet(); } catch (e) {}
-            handle(content);
+            toggle({ id: messageId, channel_id: message.channel_id }, content);
           },
         });
 
