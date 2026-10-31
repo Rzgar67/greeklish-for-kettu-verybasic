@@ -1,14 +1,25 @@
 (function () {
   const { before, after } = vendetta.patcher;
-  const { findByProps } = vendetta.metro;
-  const { React, ReactNative } = vendetta.metro.common;
+  const { findByProps, findByStoreName } = vendetta.metro;
+  const { React, ReactNative, stylesheet } = vendetta.metro.common;
   const { findInReactTree } = vendetta.utils;
   const { getAssetIDByName } = vendetta.ui.assets;
+  const { semanticColors } = vendetta.ui;
+  const { Forms } = vendetta.ui.components;
   const { showToast } = vendetta.ui.toasts;
   const { showConfirmationAlert } = vendetta.ui.alerts;
 
   const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
-  const patches = [];
+  const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms.FormRow;
+  const MessageStore = findByStoreName("MessageStore");
+
+  const styles = stylesheet.createThemedStyleSheet({
+    iconComponent: {
+      width: 24,
+      height: 24,
+      tintColor: semanticColors.INTERACTIVE_NORMAL,
+    },
+  });
 
   // ---------- Greeklish -> Greek ----------
   const digraphs = [
@@ -38,97 +49,107 @@
   }
 
   async function translate(text) {
-    const greek = greeklishToGreek(text);
+    // keep mentions / emojis / channels untouched
+    const placeholders = [];
+    const safe = text.replace(/<(a?):\w+:\d+>|<@[!&]?\d+>|<#\d+>|https?:\/\/\S+/g, (m) => {
+      placeholders.push(m);
+      return ` zzph${placeholders.length - 1}zz `;
+    });
+    const greek = greeklishToGreek(safe).replace(/ζζπη(\d+)ζζ/g, (_, n) => ` zzph${n}zz `);
     const url =
       "https://translate.googleapis.com/translate_a/single?client=gtx&sl=el&tl=en&dt=t&q=" +
       encodeURIComponent(greek);
     const res = await fetch(url);
     const json = await res.json();
-    const english = json[0].map((s) => s[0]).join("");
-    return { greek, english };
+    let english = json[0].map((s) => s[0]).join("");
+    const restore = (s) =>
+      s.replace(/zzph(\d+)zz/gi, (_, n) => placeholders[Number(n)] ?? "");
+    return { greek: restore(greek), english: restore(english) };
   }
 
   async function handle(content) {
-    if (!content?.trim()) return showToast("no text to translate");
-    showToast("translating...");
+    if (!content?.trim()) return showToast("no text to translate", getAssetIDByName("Small"));
+    showToast("translating...", getAssetIDByName("LanguageIcon"));
     try {
       const { greek, english } = await translate(content);
       showConfirmationAlert({
         title: "Greeklish Translation",
-        content: `🇬🇷 ${greek}\n\n🇬🇧 ${english}`,
+        content: `🇬🇷 ${greek.trim()}\n\n🇬🇧 ${english.trim()}`,
         confirmText: "Copy English",
         cancelText: "Close",
         onConfirm: () => {
-          try { ReactNative.Clipboard.setString(english); showToast("copied"); } catch (e) {}
+          try { ReactNative.Clipboard.setString(english.trim()); showToast("copied"); } catch (e) {}
         },
       });
     } catch (e) {
-      showToast("translation failed :(");
+      console.error("[Greeklish]", e);
+      showToast("translation failed :(", getAssetIDByName("Small"));
     }
   }
 
-  // ---------- Find rows in the sheet by label ----------
-  const isRow = (x) =>
-    x && typeof x === "object" && x.props && typeof x.props.label === "string" && x.type;
+  // ---------- Patch the message long-press sheet (same method as Dislate) ----------
+  const unpatchOpenLazy = before("openLazy", LazyActionSheet, ([component, key, msg]) => {
+    const message = msg?.message;
+    if (key !== "MessageLongPressActionSheet" || !message) return;
 
-  function findRowArray(tree) {
-    return findInReactTree(
-      tree,
-      (x) => Array.isArray(x) && x.length > 0 && x.some(isRow)
-    );
-  }
+    component.then((instance) => {
+      const unpatch = after("default", instance, (_, component) => {
+        React.useEffect(() => () => { unpatch(); }, []);
 
-  function makeRow(sibling, message, key) {
-    const iconId = getAssetIDByName("ic_locale_24px") ?? getAssetIDByName("ic_globe_24px");
-    const oldIcon = sibling.props.icon;
-    let icon = oldIcon;
-    try {
-      if (oldIcon && oldIcon.type) {
-        icon = React.createElement(oldIcon.type, { ...oldIcon.props, source: iconId });
-      }
-    } catch (e) {}
-    return React.createElement(sibling.type, {
-      ...sibling.props,
-      key,
-      label: "Translate Greeklish",
-      icon,
-      onPress: () => {
-        try { LazyActionSheet.hideActionSheet(); } catch (e) {}
-        handle(message.content);
-      },
-      // strip props that would make it behave like the sibling
-      trailing: undefined,
-      subLabel: undefined,
-      variant: undefined,
-      destructive: undefined,
-      arrow: undefined,
-    });
-  }
+        const original = MessageStore?.getMessage?.(message.channel_id, message.id);
+        const content = original?.content ?? message.content;
+        if (!content) return;
 
-  patches.push(
-    before("openLazy", LazyActionSheet, ([component, key, msg]) => {
-      const message = msg?.message;
-      if (!message || !String(key).includes("MessageLongPress")) return;
+        const icon = getAssetIDByName("LanguageIcon") ?? getAssetIDByName("ic_locale_24px");
 
-      component.then((instance) => {
-        const unpatch = after("default", instance, (_, comp) => {
-          React.useEffect(() => () => { unpatch(); }, []);
-
-          const rows = findRowArray(comp);
-          if (!rows) return;
-          if (rows.some((r) => r?.props?.label === "Translate Greeklish")) return;
-
-          const idx = rows.findIndex((r) => isRow(r) && /copy text/i.test(r.props.label));
-          const sibling = rows[idx >= 0 ? idx : 0];
-          if (!isRow(sibling)) return;
-
-          rows.splice(idx >= 0 ? idx + 1 : 1, 0, makeRow(sibling, message, "greeklish-translate"));
+        const row = React.createElement(ActionSheetRow, {
+          label: "Translate Greeklish",
+          icon: ActionSheetRow.Icon
+            ? React.createElement(ActionSheetRow.Icon, {
+                source: icon,
+                IconComponent: () =>
+                  React.createElement(ReactNative.Image, {
+                    resizeMode: "cover",
+                    style: styles.iconComponent,
+                    source: icon,
+                  }),
+              })
+            : undefined,
+          onPress: () => {
+            try { LazyActionSheet.hideActionSheet(); } catch (e) {}
+            handle(content);
+          },
         });
+
+        const groups = findInReactTree(
+          component,
+          (c) => Array.isArray(c) && c[0]?.type?.name === "ActionSheetRowGroup"
+        );
+
+        if (groups?.length) {
+          for (let gi = 0; gi < groups.length; gi++) {
+            const groupChildren = findInReactTree(
+              groups[gi],
+              (c) => Array.isArray(c) && c.some((child) => child?.type?.name === "ActionSheetRow")
+            );
+            if (groupChildren) {
+              groupChildren.unshift(row);
+              return;
+            }
+          }
+        }
+
+        // fallback
+        const buttons = findInReactTree(
+          component,
+          (x) => Array.isArray(x) && x[0]?.type?.name === "ActionSheetRow"
+        );
+        if (buttons) buttons.unshift(row);
       });
-    })
-  );
+    }).catch((err) => console.error("[Greeklish] LazyActionSheet failed:", err));
+  });
 
   return {
-    onUnload: () => patches.forEach((p) => p()),
+    onUnload: () => unpatchOpenLazy(),
   };
 })();
