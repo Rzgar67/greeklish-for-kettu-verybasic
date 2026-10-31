@@ -3,6 +3,6 @@
   "description": "Long-press a message and pick 'Translate Greeklish' to convert it to Greek and translate it to English.",
   "authors": [{ "name": "Rzg" }],
   "main": "index.js",
-  "hash": "greeklish-v1",
+  "hash": "greeklish-v5",
   "vendetta": { "icon": "ic_locale_24px" }
 }
