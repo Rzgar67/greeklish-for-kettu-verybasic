@@ -8,8 +8,6 @@
   const { showConfirmationAlert } = vendetta.ui.alerts;
 
   const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
-  const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow;
-
   const patches = [];
 
   // ---------- Greeklish -> Greek ----------
@@ -36,7 +34,6 @@
       out += singles[ch] ?? ch;
       i++;
     }
-    // final sigma
     return out.replace(/σ(?![α-ωά-ώ])/g, "ς");
   }
 
@@ -52,8 +49,8 @@
   }
 
   async function handle(content) {
-    if (!content?.trim()) return showToast("no text to translate", getAssetIDByName("Small"));
-    showToast("translating...", getAssetIDByName("ic_locale_24px"));
+    if (!content?.trim()) return showToast("no text to translate");
+    showToast("translating...");
     try {
       const { greek, english } = await translate(content);
       showConfirmationAlert({
@@ -62,42 +59,70 @@
         confirmText: "Copy English",
         cancelText: "Close",
         onConfirm: () => {
-          try { ReactNative.Clipboard.setString(english); showToast("copied", getAssetIDByName("toast_copy_link")); } catch (e) {}
+          try { ReactNative.Clipboard.setString(english); showToast("copied"); } catch (e) {}
         },
       });
     } catch (e) {
-      showToast("translation failed :(", getAssetIDByName("Small"));
+      showToast("translation failed :(");
     }
   }
 
-  // ---------- Patch message long-press sheet ----------
+  // ---------- Find rows in the sheet by label ----------
+  const isRow = (x) =>
+    x && typeof x === "object" && x.props && typeof x.props.label === "string" && x.type;
+
+  function findRowArray(tree) {
+    return findInReactTree(
+      tree,
+      (x) => Array.isArray(x) && x.length > 0 && x.some(isRow)
+    );
+  }
+
+  function makeRow(sibling, message, key) {
+    const iconId = getAssetIDByName("ic_locale_24px") ?? getAssetIDByName("ic_globe_24px");
+    const oldIcon = sibling.props.icon;
+    let icon = oldIcon;
+    try {
+      if (oldIcon && oldIcon.type) {
+        icon = React.createElement(oldIcon.type, { ...oldIcon.props, source: iconId });
+      }
+    } catch (e) {}
+    return React.createElement(sibling.type, {
+      ...sibling.props,
+      key,
+      label: "Translate Greeklish",
+      icon,
+      onPress: () => {
+        try { LazyActionSheet.hideActionSheet(); } catch (e) {}
+        handle(message.content);
+      },
+      // strip props that would make it behave like the sibling
+      trailing: undefined,
+      subLabel: undefined,
+      variant: undefined,
+      destructive: undefined,
+      arrow: undefined,
+    });
+  }
+
   patches.push(
     before("openLazy", LazyActionSheet, ([component, key, msg]) => {
       const message = msg?.message;
-      if (key !== "MessageLongPressActionSheet" || !message) return;
+      if (!message || !String(key).includes("MessageLongPress")) return;
 
       component.then((instance) => {
         const unpatch = after("default", instance, (_, comp) => {
           React.useEffect(() => () => { unpatch(); }, []);
 
-          const buttons = findInReactTree(
-            comp,
-            (x) => Array.isArray(x) && x[0]?.type?.name === "ButtonRow"
-          );
-          if (!buttons) return;
+          const rows = findRowArray(comp);
+          if (!rows) return;
+          if (rows.some((r) => r?.props?.label === "Translate Greeklish")) return;
 
-          const Row = ActionSheetRow ?? buttons[0].type;
-          const row = React.createElement(Row, {
-            label: "Translate Greeklish",
-            icon: React.createElement(Row.Icon ?? (() => null), {
-              source: getAssetIDByName("ic_locale_24px"),
-            }),
-            onPress: () => {
-              LazyActionSheet.hideActionSheet();
-              handle(message.content);
-            },
-          });
-          buttons.splice(1, 0, row);
+          const idx = rows.findIndex((r) => isRow(r) && /copy text/i.test(r.props.label));
+          const sibling = rows[idx >= 0 ? idx : 0];
+          if (!isRow(sibling)) return;
+
+          rows.splice(idx >= 0 ? idx + 1 : 1, 0, makeRow(sibling, message, "greeklish-translate"));
         });
       });
     })
