@@ -8,6 +8,7 @@
   const { Forms } = vendetta.ui.components;
   const { storage } = vendetta.plugin;
   const { useProxy } = vendetta.storage;
+  const { registerCommand } = vendetta.commands;
 
   const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
   const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms.FormRow;
@@ -331,8 +332,75 @@ Reply with ONLY the English translation. No quotes, no explanations. If you are 
     }).catch((err) => console.error("[Greeklish] LazyActionSheet failed:", err));
   });
 
+  // ---------- /greeklish slash command (config without the settings page) ----------
+  const ClydeUtils = findByProps("sendBotMessage");
+  const mask = (k) => (k ? String(k).slice(0, 4) + "…" + String(k).slice(-3) : "(none)");
+  const statusText = () =>
+    "**Greeklish config**\n" +
+    `AI: ${storage.useAI ? "on" : "off"}\n` +
+    `URL: ${storage.baseUrl || "(none)"}\n` +
+    `Model: ${storage.model || "(none)"}\n` +
+    `Key: ${mask(storage.apiKey)}\n` +
+    `Context messages: ${storage.contextCount}`;
+
+  const opt = (name, description, type) => ({
+    name,
+    displayName: name,
+    description,
+    displayDescription: description,
+    type,
+    required: false,
+  });
+
+  const unregisterCommand = registerCommand({
+    name: "greeklish",
+    displayName: "greeklish",
+    description: "Configure the Greeklish translator (AI mode, key, model...)",
+    displayDescription: "Configure the Greeklish translator (AI mode, key, model...)",
+    applicationId: "-1",
+    type: 1,
+    inputType: 1,
+    options: [
+      opt("ai", "Turn AI translation on or off", 5),
+      opt("url", "API base URL (OpenAI-compatible)", 3),
+      opt("key", "API key", 3),
+      opt("model", "Model name", 3),
+      opt("context", "How many previous messages to send as context (0 = none)", 3),
+      opt("test", "Test the AI connection", 5),
+    ],
+    async execute(args, ctx) {
+      const get = (n) => args.find((a) => a.name === n)?.value;
+      let out = [];
+      try {
+        if (get("ai") !== undefined) { storage.useAI = !!get("ai"); out.push(`AI turned ${storage.useAI ? "on" : "off"}.`); }
+        if (get("url") !== undefined) { storage.baseUrl = String(get("url")).trim(); out.push("URL saved."); }
+        if (get("key") !== undefined) { storage.apiKey = String(get("key")).trim(); out.push("Key saved."); }
+        if (get("model") !== undefined) { storage.model = String(get("model")).trim(); out.push("Model saved."); }
+        if (get("context") !== undefined) { storage.contextCount = String(get("context")).replace(/[^0-9]/g, "") || "0"; out.push("Context saved."); }
+        if (get("test")) {
+          if (!aiReady()) {
+            out.push("❌ Test failed: turn AI on and set url, key and model first.");
+          } else {
+            try {
+              const r = await aiRequest("Translate this message:\nAnpmn ga t pxndi");
+              out.push(`✅ AI works: "Anpmn ga t pxndi" → ${r}`);
+            } catch (e) {
+              out.push(`❌ AI test failed: ${String(e?.message ?? e)}`);
+            }
+          }
+        }
+      } catch (e) {
+        out.push(`Error: ${String(e?.message ?? e)}`);
+      }
+      ClydeUtils.sendBotMessage(ctx.channel.id, (out.length ? out.join("\n") + "\n\n" : "") + statusText());
+    },
+  });
+
   return {
-    onUnload: () => unpatchOpenLazy(),
+    onUnload: () => {
+      unpatchOpenLazy();
+      try { unregisterCommand(); } catch (e) {}
+    },
     settings: Settings,
   };
 })();
