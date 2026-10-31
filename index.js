@@ -6,6 +6,8 @@
   const { getAssetIDByName } = vendetta.ui.assets;
   const { semanticColors } = vendetta.ui;
   const { Forms } = vendetta.ui.components;
+  const { storage } = vendetta.plugin;
+  const { useProxy } = vendetta.storage;
 
   const LazyActionSheet = findByProps("openLazy", "hideActionSheet");
   const ActionSheetRow = findByProps("ActionSheetRow")?.ActionSheetRow ?? Forms.FormRow;
@@ -20,10 +22,20 @@
     },
   });
 
+  // ---------- settings defaults ----------
+  const defaults = {
+    useAI: false,
+    baseUrl: "https://api.openai.com/v1",
+    apiKey: "",
+    model: "",
+    contextCount: "5",
+  };
+  for (const k in defaults) if (storage[k] === undefined) storage[k] = defaults[k];
+
   // messageId -> original content (so we can revert)
   let cache = {};
 
-  // ---------- Greeklish -> Greek ----------
+  // ---------- Greeklish -> Greek (rule based, used for Google mode) ----------
   const digraphs = [
     ["th", "θ"], ["ps", "ψ"], ["ks", "ξ"], ["ch", "χ"], ["ou", "ου"],
     ["ai", "αι"], ["ei", "ει"], ["oi", "οι"], ["mp", "μπ"], ["nt", "ντ"],
@@ -50,8 +62,7 @@
     return out.replace(/σ(?![α-ωά-ώ])/g, "ς");
   }
 
-  async function translate(text) {
-    // keep mentions / emojis / channels / links untouched
+  async function translateGoogle(text) {
     const placeholders = [];
     const safe = text.replace(/<(a?):\w+:\d+>|<@[!&]?\d+>|<#\d+>|https?:\/\/\S+/g, (m) => {
       placeholders.push(m);
@@ -64,11 +75,79 @@
     const res = await fetch(url);
     const json = await res.json();
     const english = json[0].map((s) => s[0]).join("");
-    const restore = (s) =>
-      s.replace(/zzph(\d+)zz/gi, (_, n) => placeholders[Number(n)] ?? "");
-    return restore(english).trim();
+    return english
+      .replace(/zzph(\d+)zz/gi, (_, n) => placeholders[Number(n)] ?? "")
+      .trim();
   }
 
+  // ---------- AI translation (any OpenAI-compatible API) ----------
+  const SYSTEM_PROMPT = `You translate Discord chat messages written in "Greeklish" (Greek typed with Latin letters) into natural English.
+People may try to hide their meaning, so expect:
+- vowels dropped or heavily abbreviated words (e.g. "kl" = "καλά" = good, "pxndi" = "παιχνίδι" = game)
+- slang, typos, numbers used as letters (8 = θ, 3 = ε), mixed English/Turkish words, names and nicknames left as-is
+- messages that are already English or another language: just translate/keep them naturally
+Use the recent chat messages (if given) to resolve ambiguity.
+Examples:
+"Ga s token ps sai" -> "Hey token, how are you?"
+"kl es?" -> "Good, you?"
+"xromai" -> "I'm glad"
+"Anpmn ga t pxndi" -> "I can't wait for the game"
+Keep mentions (<@123>), emojis (<:name:123>) and links exactly as written.
+Reply with ONLY the English translation. No quotes, no explanations. If you are unsure of a word, give your best guess and put "(?)" after it.`;
+
+  function getContext(msg) {
+    const n = parseInt(storage.contextCount, 10) || 0;
+    if (n <= 0) return "";
+    try {
+      const col = MessageStore.getMessages(msg.channel_id);
+      let arr = col?.toArray?.() ?? col?._array ?? [];
+      arr = [...arr].sort((a, b) => a.id.length - b.id.length || (a.id < b.id ? -1 : 1));
+      const i = arr.findIndex((m) => m.id === msg.id);
+      const prev = (i >= 0 ? arr.slice(Math.max(0, i - n), i) : arr.slice(-n))
+        .filter((m) => m.content)
+        .map((m) => `${m.author?.username ?? "?"}: ${m.content}`);
+      return prev.join("\n");
+    } catch (e) {
+      return "";
+    }
+  }
+
+  async function aiRequest(userContent) {
+    const base = String(storage.baseUrl || "").trim().replace(/\/+$/, "");
+    const res = await fetch(base + "/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + String(storage.apiKey).trim(),
+      },
+      body: JSON.stringify({
+        model: String(storage.model).trim(),
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userContent },
+        ],
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`HTTP ${res.status}: ${body.slice(0, 300)}`);
+    }
+    const json = await res.json();
+    return String(json.choices[0].message.content).trim();
+  }
+
+  async function translateAI(text, msg) {
+    const ctx = getContext(msg);
+    const user = (ctx ? `Recent chat (context only, do not translate):\n${ctx}\n\n` : "") +
+      `Translate this message:\n${text}`;
+    return aiRequest(user);
+  }
+
+  const aiReady = () =>
+    storage.useAI && storage.apiKey && storage.baseUrl && storage.model;
+
+  // ---------- edit the message locally ----------
   function updateMessage(msg, content) {
     FluxDispatcher.dispatch({
       type: "MESSAGE_UPDATE",
@@ -85,23 +164,105 @@
 
   async function toggle(msg, content) {
     try {
-      // Revert
       if (cache[msg.id] !== undefined) {
         updateMessage(msg, cache[msg.id]);
         delete cache[msg.id];
         return;
       }
-      // Translate
       if (!content?.trim()) return;
-      const english = await translate(content);
+
+      let english;
+      let tag = "en";
+      if (aiReady()) {
+        try {
+          english = await translateAI(content, msg);
+          tag = "ai-en";
+        } catch (e) {
+          console.error("[Greeklish] AI failed, falling back to Google:", e);
+        }
+      }
+      if (english === undefined) english = await translateGoogle(content);
+
       cache[msg.id] = content;
-      updateMessage(msg, `${content}\n${english} \`[en]\``);
+      updateMessage(msg, `${content}\n${english} \`[${tag}]\``);
     } catch (e) {
       console.error("[Greeklish]", e);
       try {
         ReactNative.Alert.alert("Greeklish Translator", "Translation failed. Check debug logs.");
       } catch (_) {}
     }
+  }
+
+  // ---------- settings page ----------
+  function Settings() {
+    useProxy(storage);
+    const { ScrollView } = ReactNative;
+    const { FormSection, FormInput, FormSwitchRow, FormText, FormRow, FormDivider } = Forms;
+
+    return React.createElement(
+      ScrollView,
+      { style: { flex: 1 } },
+      React.createElement(
+        FormSection,
+        { title: "AI translation", titleStyleType: "no_border" },
+        React.createElement(FormSwitchRow, {
+          label: "Use AI for translating",
+          subLabel: "Much better at vowel-less / slangy Greeklish. Uses your own API key. Falls back to Google if it fails.",
+          value: !!storage.useAI,
+          onValueChange: (v) => { storage.useAI = v; },
+        }),
+        React.createElement(FormDivider),
+        React.createElement(FormInput, {
+          title: "API base URL (OpenAI-compatible)",
+          placeholder: "https://api.openai.com/v1",
+          value: storage.baseUrl,
+          onChange: (v) => { storage.baseUrl = v; },
+          autoCapitalize: "none",
+          autoCorrect: false,
+        }),
+        React.createElement(FormInput, {
+          title: "API key",
+          placeholder: "sk-...",
+          value: storage.apiKey,
+          onChange: (v) => { storage.apiKey = v; },
+          secureTextEntry: true,
+          autoCapitalize: "none",
+          autoCorrect: false,
+        }),
+        React.createElement(FormInput, {
+          title: "Model name",
+          placeholder: "exact model id from your provider",
+          value: storage.model,
+          onChange: (v) => { storage.model = v; },
+          autoCapitalize: "none",
+          autoCorrect: false,
+        }),
+        React.createElement(FormInput, {
+          title: "Previous messages sent as context (0 = none)",
+          placeholder: "5",
+          value: String(storage.contextCount),
+          onChange: (v) => { storage.contextCount = v.replace(/[^0-9]/g, ""); },
+          keyboardType: "number-pad",
+        }),
+        React.createElement(FormRow, {
+          label: "Test AI connection",
+          onPress: async () => {
+            try {
+              if (!aiReady()) throw new Error("Turn on AI and fill in URL, key and model first.");
+              const out = await aiRequest("Translate this message:\nAnpmn ga t pxndi");
+              ReactNative.Alert.alert("AI works ✅", `"Anpmn ga t pxndi" →\n${out}`);
+            } catch (e) {
+              ReactNative.Alert.alert("AI test failed ❌", String(e?.message ?? e));
+            }
+          },
+        }),
+        React.createElement(FormText, {
+          style: { padding: 16, opacity: 0.7 },
+          children:
+            "Your key is stored only on this device and only sent to the base URL above. When AI is on, the message you translate (plus the context messages) is sent to that provider.",
+        })
+      )
+    );
   }
 
   // ---------- Patch the message long-press sheet (same method as Dislate) ----------
@@ -117,7 +278,6 @@
         const target = original ?? message;
         const messageId = target.id ?? message.id;
         const isTranslated = cache[messageId] !== undefined;
-        // when already translated, original text comes from the cache
         const content = isTranslated ? cache[messageId] : (original?.content ?? message.content);
         if (!content) return;
 
@@ -162,7 +322,6 @@
           }
         }
 
-        // fallback
         const buttons = findInReactTree(
           component,
           (x) => Array.isArray(x) && x[0]?.type?.name === "ActionSheetRow"
@@ -174,5 +333,6 @@
 
   return {
     onUnload: () => unpatchOpenLazy(),
+    settings: Settings,
   };
 })();
